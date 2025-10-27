@@ -1,0 +1,312 @@
+#define BLYNK_TEMPLATE_ID "TMPL6H4ggjG4y"
+#define BLYNK_TEMPLATE_NAME "SmartPet"
+#define BLYNK_AUTH_TOKEN "SFvhCDxNdT1pULjFCf9Izo-Zl3LkR4fd"
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <BlynkSimpleEsp32.h>
+#include "HX711.h"
+#include <ESP32Servo.h>
+#include <TimeLib.h>
+#include <WidgetRTC.h>
+#include <math.h>
+#include <UniversalTelegramBot.h>
+
+// ====== WiFi Configuration ======
+char ssid[] = "00";
+char pass[] = "123456789";
+
+// ====== Telegram Configuration ======
+#define BOT_TOKEN "7905124249:AAGBpb9EwAk4_YeP-zsEHejRW-HsEF62auE"
+#define CHAT_ID   "8243388341"
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+
+void sendTelegram(String msg) {
+  if (WiFi.status() == WL_CONNECTED) {
+    bot.sendMessage(CHAT_ID, msg, "");
+    Serial.println("📨 ส่งข้อความไป Telegram: " + msg);
+  } else {
+    Serial.println("⚠️ ไม่สามารถส่ง Telegram ได้ (WiFi หลุด)");
+  }
+}
+
+// ====== HX711 Configuration ======
+#define LOADCELL_DOUT_PIN 19
+#define LOADCELL_SCK_PIN 18
+HX711 scale;
+
+// ====== Servo Configuration ======
+#define SERVO_PIN 17
+Servo feederServo;
+
+// ====== Calibration Factor ======
+float calibration_factor = -7050.0;
+float weight = 0.0;
+
+// ====== Feeding Variables ======
+float threshold = 5.0;
+float targetWeight = 100.0;
+float feedPortion = 0.0;
+bool systemActive = false;
+
+// ====== Feeding Calculation Variables ======
+float dogWeightKg = 0.0;
+int activityLevel = 1;
+float kcalPerGram = 3.5;
+
+// ====== Daily Summary Variables ======
+int feedCountToday = 0;
+float totalFeedWeight = 0.0;
+float totalAccuracyPercent = 0.0;
+
+// ====== Weekly Summary Variables ======
+int dayCount = 0;
+float weeklyFeedWeight = 0.0;
+float weeklyAccuracy = 0.0;
+int weeklyFeedCount = 0;
+
+// ====== Timer ======
+BlynkTimer timer;
+WidgetRTC rtc;
+
+// ====== Feeding Time Schedule ======
+int breakfastHour = 8, breakfastMinute = 0;
+int lunchHour = 13, lunchMinute = 0;
+int dinnerHour = 19, dinnerMinute = 0;
+
+// ====== ฟังก์ชันควบคุม Servo ======
+void openFeeder() {
+  feederServo.write(180);
+  Serial.println("🍽️ [Servo] เปิดให้อาหาร...");
+  Blynk.virtualWrite(V3, 1);
+  sendTelegram("🍽️ เริ่มให้อาหารสัตว์เลี้ยงแล้ว 🐾");
+}
+
+void closeFeeder() {
+  feederServo.write(0);
+  Serial.println("🚫 [Servo] ปิดให้อาหาร");
+  Blynk.virtualWrite(V3, 0);
+  sendTelegram("✅ ปิดช่องให้อาหารเรียบร้อยแล้ว");
+}
+
+// ====== ฟังก์ชันคำนวณพลังงาน ======
+float calcDailyKcal(float weight_kg, int actLevel) {
+  float base = 110.0 * pow(weight_kg, 0.75);
+  if (actLevel == 0) base *= 0.9;
+  else if (actLevel == 2) base *= 1.1;
+  return base;
+}
+
+float calcFeedGrams(float kcalNeeded, float kcalPerGram) {
+  return kcalNeeded / kcalPerGram;
+}
+
+// ====== คำนวณปริมาณอาหารต่อวัน ======
+void computeTarget() {
+  if (dogWeightKg > 0 && kcalPerGram > 0) {
+    float kcalNeeded = calcDailyKcal(dogWeightKg, activityLevel);
+    float grams = calcFeedGrams(kcalNeeded, kcalPerGram);
+    targetWeight = grams;
+    feedPortion = grams / 3.0;
+
+    Serial.println("📊 [Feeding Calculation]");
+    Serial.printf("  ▸ น้ำหนักสุนัข: %.2f kg\n", dogWeightKg);
+    Serial.printf("  ▸ ระดับกิจกรรม: %d\n", activityLevel);
+    Serial.printf("  ▸ kcal ต่อกรัม: %.2f\n", kcalPerGram);
+    Serial.printf("  ➜ ต้องการอาหาร %.2f kcal/วัน ≈ %.2f g (มื้อละ %.2f g)\n\n", kcalNeeded, grams, feedPortion);
+
+    Blynk.virtualWrite(V1, targetWeight);
+    Blynk.virtualWrite(V10, feedPortion);
+
+    String msg = "📊 ปรับค่าปริมาณอาหารใหม่แล้ว\n"
+                 "🐶 น้ำหนัก: " + String(dogWeightKg, 1) + " kg\n"
+                 "🏃‍♂️ กิจกรรม: " + String(activityLevel) + "\n"
+                 "🍗 มื้อละ: " + String(feedPortion, 1) + " g";
+    sendTelegram(msg);
+  } else {
+    Serial.println("⚠️ กรุณากรอกข้อมูลให้ครบก่อนคำนวณ");
+  }
+}
+
+// ====== kcal/กรัม อัตโนมัติ ======
+void updateKcalPerGram() {
+  if (dogWeightKg <= 0) return;
+
+  if (dogWeightKg < 5) kcalPerGram = 3.8;
+  else if (dogWeightKg < 15) kcalPerGram = 3.5;
+  else kcalPerGram = 3.2;
+
+  if (activityLevel == 0) kcalPerGram *= 0.95;
+  else if (activityLevel == 2) kcalPerGram *= 1.05;
+
+  Serial.printf("🔥 [Auto kcal/gram]: %.2f kcal/g\n", kcalPerGram);
+  Blynk.virtualWrite(V9, kcalPerGram);
+}
+
+// ====== ฟังก์ชันเก็บข้อมูลรายวัน ======
+void recordDailyFeed(float weightFed, float feedPortion) {
+  feedCountToday++;
+  totalFeedWeight += weightFed;
+  float diffPercent = abs((weightFed - feedPortion) / feedPortion) * 100.0;
+  totalAccuracyPercent += (100.0 - diffPercent);
+
+  Serial.printf("📝 [Daily Record] มื้อที่ %d | ให้อาหาร %.1f g | คลาดเคลื่อน %.1f%%\n",
+                feedCountToday, weightFed, diffPercent);
+
+  sendTelegram("🕒 ให้อาหารมื้อที่ " + String(feedCountToday) +
+               " ปริมาณ " + String(weightFed, 1) + " g");
+}
+
+// ====== สรุปรายสัปดาห์ ======
+void sendWeeklyHealthSummary() {
+  if (dayCount == 0) return;
+
+  float avgFeedWeek = weeklyFeedWeight / dayCount;
+  float avgAccuracyWeek = weeklyAccuracy / dayCount;
+  float avgMeals = (float)weeklyFeedCount / dayCount;
+
+  String status = "✅ สุขภาพปกติ";
+  if (avgAccuracyWeek < 85) status = "⚠️ แนวโน้มกินน้อยลง";
+  else if (avgAccuracyWeek > 115) status = "⚠️ แนวโน้มกินมากเกินไป";
+
+  String weeklyReport = "📆 สรุปสุขภาพรายสัปดาห์\n"
+                        "📊 จำนวนวันที่บันทึก: " + String(dayCount) + "\n"
+                        "🍽️ มื้อเฉลี่ยต่อวัน: " + String(avgMeals, 1) + "\n"
+                        "⚖️ ปริมาณเฉลี่ย: " + String(avgFeedWeek, 1) + " g\n"
+                        "🎯 ความแม่นยำเฉลี่ย: " + String(avgAccuracyWeek, 1) + "%\n"
+                        "🩺 แนวโน้มสุขภาพ: " + status;
+
+  sendTelegram(weeklyReport);
+
+  // 🔄 รีเซ็ตข้อมูลสัปดาห์
+  dayCount = 0;
+  weeklyFeedCount = 0;
+  weeklyFeedWeight = 0.0;
+  weeklyAccuracy = 0.0;
+
+  Serial.println("✅ [Weekly Summary Sent]");
+}
+
+// ====== ฟังก์ชันสรุปสุขภาพประจำวัน ======
+void sendDailyHealthSummary() {
+  if (feedCountToday == 0) return;
+
+  float avgFeed = totalFeedWeight / feedCountToday;
+  float avgAccuracy = totalAccuracyPercent / feedCountToday;
+
+  String status = "✅ ปกติ";
+  if (avgAccuracy < 85) status = "⚠️ กินน้อยลงกว่าปกติ";
+  else if (avgAccuracy > 115) status = "⚠️ กินมากเกินไป";
+
+  String summary = "📅 สรุปสุขภาพประจำวัน\n"
+                   "🍽️ จำนวนมื้อ: " + String(feedCountToday) + "\n"
+                   "⚖️ ปริมาณเฉลี่ย: " + String(avgFeed, 1) + " g\n"
+                   "🎯 ความแม่นยำเฉลี่ย: " + String(avgAccuracy, 1) + "%\n"
+                   "🩺 สถานะ: " + status;
+  sendTelegram(summary);
+
+  // ✅ บันทึกลงข้อมูลรายสัปดาห์
+  weeklyFeedCount += feedCountToday;
+  weeklyFeedWeight += avgFeed;
+  weeklyAccuracy += avgAccuracy;
+  dayCount++;
+
+  // 🔁 รีเซ็ตข้อมูลวันใหม่
+  feedCountToday = 0;
+  totalFeedWeight = 0.0;
+  totalAccuracyPercent = 0.0;
+
+  // 📆 ครบ 7 วัน → สรุปรายสัปดาห์
+  if (dayCount >= 7) sendWeeklyHealthSummary();
+}
+
+// ====== อ่านค่าน้ำหนัก ======
+void readWeight() {
+  if (scale.is_ready()) {
+    weight = -scale.get_units(10);
+    if (abs(weight) < 1.0) weight = 0.0;
+
+    Serial.printf("🦴 [Weight] ปัจจุบัน: %.2f g | เป้าหมาย/มื้อ: %.2f g\n", weight, feedPortion);
+    Blynk.virtualWrite(V2, weight);
+
+    if (systemActive && weight >= feedPortion) {
+      closeFeeder();
+      systemActive = false;
+
+      recordDailyFeed(weight, feedPortion);
+
+      if (feedCountToday >= 3) {
+        sendTelegram("📅 ให้อาหารครบ 3 มื้อแล้ว — กำลังสรุปสุขภาพประจำวัน...");
+        sendDailyHealthSummary();
+      }
+    }
+  } else {
+    Serial.println("❌ [HX711] ไม่ตอบสนอง");
+  }
+}
+
+// ====== ตรวจสอบเวลาให้อาหาร ======
+void checkFeedTime() {
+  int h = hour();
+  int m = minute();
+
+  if ((h == breakfastHour && m == breakfastMinute) ||
+      (h == lunchHour && m == lunchMinute) ||
+      (h == dinnerHour && m == dinnerMinute)) {
+
+    if (!systemActive) {
+      openFeeder();
+      systemActive = true;
+
+      if (h == breakfastHour) sendTelegram("⏰ ให้อาหารมื้อเช้า 🐶");
+      else if (h == lunchHour) sendTelegram("⏰ ให้อาหารมื้อเที่ยง 🐕");
+      else if (h == dinnerHour) sendTelegram("⏰ ให้อาหารมื้อเย็น 🐩");
+    }
+  }
+}
+
+// ====== BLYNK INPUT ======
+BLYNK_WRITE(V5) { TimeInputParam t(param); if (t.hasStartTime()) { breakfastHour = t.getStartHour(); breakfastMinute = t.getStartMinute(); }}
+BLYNK_WRITE(V6) { TimeInputParam t(param); if (t.hasStartTime()) { lunchHour = t.getStartHour(); lunchMinute = t.getStartMinute(); }}
+BLYNK_WRITE(V7) { TimeInputParam t(param); if (t.hasStartTime()) { dinnerHour = t.getStartHour(); dinnerMinute = t.getStartMinute(); }}
+BLYNK_WRITE(V4) { int pinValue = param.asInt(); if (pinValue == 1 && !systemActive) { openFeeder(); systemActive = true; Blynk.virtualWrite(V4, 0); } }
+BLYNK_WRITE(V11) { dogWeightKg = param.asFloat(); updateKcalPerGram(); computeTarget(); }
+BLYNK_WRITE(V8) { activityLevel = param.asInt(); updateKcalPerGram(); computeTarget(); }
+
+// ====== Setup ======
+void setup() {
+  delay(1000);
+  Serial.begin(115200);
+  Serial.println("🐾 Starting Smart Pet Feeding System with Weekly Summary...\n");
+
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi Connected!");
+  client.setInsecure();
+  client.setTimeout(15000);
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  feederServo.setPeriodHertz(50);
+  feederServo.attach(SERVO_PIN, 500, 2400);
+  closeFeeder();
+
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(calibration_factor);
+  scale.tare();
+
+  sendTelegram("🐾 ระบบ SmartPet พร้อมทำงานแล้ว!");
+
+  timer.setInterval(1000L, readWeight);
+  timer.setInterval(60000L, checkFeedTime);
+}
+
+// ====== Loop ======
+void loop() {
+  Blynk.run();
+  timer.run();
+}
