@@ -1,0 +1,27 @@
+function doPost(e) {
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+
+    // ตรวจสอบว่ามีข้อมูลส่งมาจริงไหม
+    if (!e || !e.postData || !e.postData.contents) {
+      return ContentService.createTextOutput("❌ No POST data received");
+    }
+
+    // แปลง JSON ที่ได้รับจาก ESP32
+    const data = JSON.parse(e.postData.contents);
+
+    // ดึงค่าจาก JSON (ถ้าไม่มีให้เป็นช่องว่าง)
+    const now = new Date();
+    const weight = data.weight || "";
+    const portion = data.portion || "";
+    const accuracy = data.accuracy || "";
+
+    // เพิ่มข้อมูลลงในชีต
+    sheet.appendRow([now, weight, portion, accuracy]);
+
+    return ContentService.createTextOutput("✅ Data added OK");
+  } catch (err) {
+    // จัดการข้อผิดพลาดและส่งกลับข้อความ
+    return ContentService.createTextOutput("❌ Error: " + err.message);
+  }
+}
