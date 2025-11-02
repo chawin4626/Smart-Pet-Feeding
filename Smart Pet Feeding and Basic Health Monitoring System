@@ -14,8 +14,8 @@
 #include <UniversalTelegramBot.h>
 
 // ====== WiFi Configuration ======
-char ssid[] = "Permpoon_B4_2";
-char pass[] = "";
+char ssid[] = "CH1";
+char pass[] = "123456789";
 
 // ====== Telegram Configuration ======
 #define BOT_TOKEN "7905124249:AAGBpb9EwAk4_YeP-zsEHejRW-HsEF62auE"
